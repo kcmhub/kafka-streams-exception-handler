@@ -1,8 +1,5 @@
 package com.example.kafkastreams.topology;
 
-import com.example.kafkastreams.handler.DlqDeserializationExceptionHandler;
-import com.example.kafkastreams.handler.DlqProcessingExceptionHandler;
-import com.example.kafkastreams.handler.DlqProductionExceptionHandler;
 import com.example.kafkastreams.model.Order;
 import com.example.kafkastreams.serde.JsonSerde;
 import org.apache.kafka.common.serialization.*;
@@ -10,6 +7,9 @@ import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.TestInputTopic;
 import org.apache.kafka.streams.TestOutputTopic;
 import org.apache.kafka.streams.TopologyTestDriver;
+import org.apache.kafka.streams.errors.DefaultProductionExceptionHandler;
+import org.apache.kafka.streams.errors.LogAndContinueExceptionHandler;
+import org.apache.kafka.streams.errors.LogAndContinueProcessingExceptionHandler;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -31,12 +31,17 @@ class OrderTopologyTest {
         Properties props = new Properties();
         props.put(StreamsConfig.APPLICATION_ID_CONFIG, "test-order-app");
         props.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy:9092");
+
+        // Activate built-in DLQ support: all three handlers route failed records to
+        // this topic when this single property is set.
+        props.put(StreamsConfig.ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG, OrderTopology.DLQ_TOPIC);
+
         props.put(StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG,
-                DlqDeserializationExceptionHandler.class);
+                LogAndContinueExceptionHandler.class);
         props.put(StreamsConfig.PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG,
-                DlqProcessingExceptionHandler.class);
+                LogAndContinueProcessingExceptionHandler.class);
         props.put(StreamsConfig.DEFAULT_PRODUCTION_EXCEPTION_HANDLER_CLASS_CONFIG,
-                DlqProductionExceptionHandler.class);
+                DefaultProductionExceptionHandler.class);
 
         driver = new TopologyTestDriver(new OrderTopology().buildTopology(), props);
 
@@ -73,8 +78,9 @@ class OrderTopologyTest {
     }
 
     /**
-     * Deserialization error: bytes that are not valid JSON trigger the
-     * {@link DlqDeserializationExceptionHandler}, which routes the raw bytes to the DLQ topic.
+     * Deserialization error: bytes that are not valid JSON trigger
+     * {@link LogAndContinueExceptionHandler}, which routes the raw bytes to the DLQ
+     * topic and resumes processing of subsequent records.
      */
     @Test
     void testDeserializationError() {
@@ -96,8 +102,9 @@ class OrderTopologyTest {
 
     /**
      * Processing error (KIP-1034): a valid order with a negative amount passes
-     * deserialization but throws in {@code mapValues}. The
-     * {@link DlqProcessingExceptionHandler} routes it to the DLQ.
+     * deserialization but throws in {@code mapValues}.
+     * {@link LogAndContinueProcessingExceptionHandler} routes it to the DLQ and
+     * resumes processing of subsequent records.
      */
     @Test
     void testProcessingError_negativeAmount() {
@@ -109,7 +116,7 @@ class OrderTopologyTest {
 
     /**
      * Processing error (KIP-1034): a blank orderId causes a validation failure in
-     * {@code mapValues}.
+     * {@code mapValues}. The record is routed to the DLQ.
      */
     @Test
     void testProcessingError_blankOrderId() {

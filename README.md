@@ -1,22 +1,42 @@
 # kafka-streams-exception-handler
 
 A complete Kafka Streams 4.2.0 example that demonstrates robust exception handling for all three
-error categories using the built-in Dead Letter Queue (DLQ) API introduced in KIP-1034.
+error categories using the **built-in Dead Letter Queue (DLQ) support** introduced in
+[KIP-1034](https://cwiki.apache.org/confluence/display/KAFKA/KIP-1034%3A+Dead+letter+queue+in+Kafka+Streams).
+
+No custom exception handler classes are needed. A single configuration property activates DLQ
+routing across all three built-in handlers.
 
 ---
 
 ## Overview
 
-| Exception type | Triggered by | Handler class |
-|---|---|---|
-| **Deserialization** | Bytes that cannot be parsed into the expected type | `DlqDeserializationExceptionHandler` |
-| **Processing** (KIP-1034) | Exception thrown inside `mapValues`, `filter`, etc. | `DlqProcessingExceptionHandler` |
-| **Production / Serialization** | Failure to write or serialize a record to Kafka | `DlqProductionExceptionHandler` |
+Kafka Streams 4.0+ ships with three built-in exception handlers that natively support DLQ routing
+when the `errors.dead.letter.queue.topic.name` property is set:
 
-When any of the above errors occurs, the failing record's **raw bytes** are forwarded to the
-`orders-dlq` topic together with diagnostic headers (`error.type`, `error.exception.class`,
-`error.exception.message`, `error.source.topic`, …). Stream processing then continues with
-the next record rather than crashing the application.
+| Exception type | Triggered by | Built-in handler |
+|---|---|---|
+| **Deserialization** | Bytes that cannot be parsed into the expected type | `LogAndContinueExceptionHandler` |
+| **Processing** (KIP-1034) | Exception thrown inside `mapValues`, `filter`, etc. | `LogAndContinueProcessingExceptionHandler` |
+| **Production / Serialization** | Failure to write or serialize a record to Kafka | `DefaultProductionExceptionHandler` |
+
+When any of the above errors occurs the failing record's raw bytes are forwarded to the configured
+DLQ topic together with standard diagnostic headers added by the framework. Stream processing then
+continues with the next record (deserialization and processing errors) or the stream thread is
+stopped after DLQ routing (production errors, which are considered fatal).
+
+### Minimal configuration
+
+```java
+props.put(StreamsConfig.ERRORS_DEAD_LETTER_QUEUE_TOPIC_NAME_CONFIG, "orders-dlq");
+
+props.put(StreamsConfig.DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG,
+        LogAndContinueExceptionHandler.class);
+props.put(StreamsConfig.PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG,
+        LogAndContinueProcessingExceptionHandler.class);
+props.put(StreamsConfig.DEFAULT_PRODUCTION_EXCEPTION_HANDLER_CLASS_CONFIG,
+        DefaultProductionExceptionHandler.class);
+```
 
 ---
 
@@ -26,7 +46,7 @@ the next record rather than crashing the application.
 orders-input  ──► [deserialize] ──► mapValues (validate + enrich) ──► orders-output
                        │                         │
                   DeserializationEx          ProcessingEx
-                  Handler (DLQ)              Handler (DLQ)
+                  (LogAndContinue)           (LogAndContinue)
                        │                         │
                        └──────────┬──────────────┘
                                   ▼
@@ -153,7 +173,8 @@ echo 'bad-key:this-is-not-json' | \
     --property "key.separator=:"
 ```
 
-The application logs a deserialization error and the raw bytes appear on `orders-dlq`:
+`LogAndContinueExceptionHandler` logs the deserialization error and the raw bytes appear on
+`orders-dlq` with framework headers. Consume and inspect:
 
 ```bash
 docker exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
@@ -175,18 +196,15 @@ echo 'order-2:{"orderId":"order-2","customerId":"cust-2","amount":-1.0,"descript
     --property "key.separator=:"
 ```
 
-The record does NOT appear in `orders-output`; it lands in `orders-dlq` with
-`error.type=PROCESSING` and `error.exception.message=amount must be positive, got: -1.0`.
+The record does NOT appear in `orders-output`; it lands in `orders-dlq` with header
+`__streams.errors.message=amount must be positive, got: -1.0`.
 
 ### 7 — Serialization error
 
 Serialization errors are triggered when the configured `Serializer` fails to convert an
-in-memory object to bytes before writing to the output topic. This typically happens in
-production when a custom serializer encounters an object it cannot handle.  In this project
-the `JsonSerializer` will throw a `RuntimeException` if Jackson cannot marshal the object.
-These errors are caught by `DlqProductionExceptionHandler.handleSerializationError()`, which
-routes the raw source bytes to the DLQ with `error.type=PRODUCTION` and
-`error.serialization.origin=KEY` or `VALUE`.
+in-memory object to bytes before writing to the output topic. `DefaultProductionExceptionHandler`
+catches these, routes the raw source bytes to the DLQ topic, then fails the stream thread
+(production failures are considered fatal and require operator attention).
 
 ### 8 — Stop everything
 
@@ -197,24 +215,16 @@ docker-compose down
 
 ---
 
-## Exception Handler Summary
+## DLQ record headers
 
-| Class | Interface | Config key |
-|---|---|---|
-| `DlqDeserializationExceptionHandler` | `DeserializationExceptionHandler` | `DEFAULT_DESERIALIZATION_EXCEPTION_HANDLER_CLASS_CONFIG` |
-| `DlqProcessingExceptionHandler` | `ProcessingExceptionHandler` (KIP-1034) | `PROCESSING_EXCEPTION_HANDLER_CLASS_CONFIG` |
-| `DlqProductionExceptionHandler` | `ProductionExceptionHandler` | `DEFAULT_PRODUCTION_EXCEPTION_HANDLER_CLASS_CONFIG` |
-
-All handlers produce `ProducerRecord<byte[], byte[]>` records to `orders-dlq` enriched with
-the following headers:
+The Kafka Streams framework automatically adds the following headers to every DLQ record via
+`ExceptionHandlerUtils`:
 
 | Header | Description |
 |---|---|
-| `error.type` | `DESERIALIZATION`, `PROCESSING`, or `PRODUCTION` |
-| `error.exception.class` | Fully-qualified exception class name |
-| `error.exception.message` | Exception message (if present) |
-| `error.source.topic` | Source topic of the failed record |
-| `error.source.partition` | Source partition |
-| `error.source.offset` | Source offset |
-| `error.processor.node` | Processor node ID (processing errors only) |
-| `error.serialization.origin` | `KEY` or `VALUE` (serialization errors only) |
+| `__streams.errors.exception` | Fully-qualified exception class name |
+| `__streams.errors.message` | Exception message |
+| `__streams.errors.stacktrace` | Full stack trace |
+| `__streams.errors.topic` | Source topic of the failed record |
+| `__streams.errors.partition` | Source partition |
+| `__streams.errors.offset` | Source offset |

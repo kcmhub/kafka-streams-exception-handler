@@ -17,7 +17,7 @@ import org.slf4j.LoggerFactory;
  * <p>
  * Invalid orders (null/blank orderId or non-positive amount) throw an
  * {@link IllegalArgumentException} in {@code mapValues}, which is caught by the
- * configured {@link com.example.kafkastreams.handler.DlqProcessingExceptionHandler}
+ * configured {@link org.apache.kafka.streams.errors.LogAndContinueProcessingExceptionHandler}
  * and routed to {@code orders-dlq}.
  */
 public class OrderTopology {
